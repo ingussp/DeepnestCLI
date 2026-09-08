@@ -17,6 +17,7 @@ import {
   addClass,
   removeClass,
 } from "../utils/dom-utils.js";
+import { debugInfo, debugWarn } from "../utils/debug.js";
 
 /**
  * DOM element selectors used by the sheet dialog component
@@ -155,6 +156,7 @@ export class SheetDialogService {
     if (partsTools) {
       addClass(partsTools, CSS_CLASSES.ACTIVE);
     }
+    debugInfo("renderer.sheet-dialog.open");
   }
 
   /**
@@ -166,6 +168,7 @@ export class SheetDialogService {
     if (partsTools) {
       removeClass(partsTools, CSS_CLASSES.ACTIVE);
     }
+    debugInfo("renderer.sheet-dialog.close");
   }
 
   /**
@@ -247,6 +250,10 @@ export class SheetDialogService {
    */
   addSheet(width: number, height: number): boolean {
     if (width <= 0 || height <= 0) {
+      debugWarn("renderer.sheet-dialog.add-sheet.invalid", {
+        width,
+        height,
+      });
       return false;
     }
 
@@ -263,6 +270,15 @@ export class SheetDialogService {
       sheet.sheet = true;
     }
 
+    debugInfo("renderer.sheet-dialog.add-sheet.done", {
+      width,
+      height,
+      conversion,
+      svgWidth,
+      svgHeight,
+      importedPartsCount: parts.length,
+    });
+
     return true;
   }
 
@@ -276,6 +292,7 @@ export class SheetDialogService {
     const heightInput = getElement<HTMLInputElement>(SELECTORS.SHEET_HEIGHT_INPUT);
 
     if (!widthInput || !heightInput) {
+      debugWarn("renderer.sheet-dialog.confirm.missing-inputs");
       return false;
     }
 
@@ -294,6 +311,11 @@ export class SheetDialogService {
 
     // Add the sheet
     const success = this.addSheet(width, height);
+    debugInfo("renderer.sheet-dialog.confirm", {
+      width,
+      height,
+      success,
+    });
 
     if (success) {
       // Clear inputs and close dialog

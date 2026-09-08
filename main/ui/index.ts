@@ -34,6 +34,13 @@ import { SheetDialogService, createSheetDialogService } from "./components/sheet
 // Utility imports
 import { message } from "./utils/ui-helpers.js";
 import { getElement, getElements } from "./utils/dom-utils.js";
+import {
+  debugError,
+  debugInfo,
+  debugWarn,
+  setUiDebugLogger,
+  type DebugLoggerLike,
+} from "./utils/debug.js";
 
 /**
  * IPC renderer interface for Electron communication
@@ -67,6 +74,16 @@ declare const interact: (selector: string) => {
  * Node.js module interfaces for Electron context
  */
 declare function require(module: string): unknown;
+
+interface CreateDebugLoggerModule {
+  createDebugLogger: (options?: {
+    enabled?: boolean;
+    argv?: string[];
+    filePath?: string;
+    scope?: string;
+    isPackaged?: boolean;
+  }) => DebugLoggerLike;
+}
 
 /**
  * Global DeepNest instance (set by deepnest.js)
@@ -328,20 +345,119 @@ function isCliSheetInput(value: unknown): value is CliSheetInput {
   return isCliRectSheetInput(value) || isCliPolygonSheetInput(value);
 }
 
+function getCliJobValidationErrors(value: unknown): string[] {
+  if (!isObject(value)) {
+    return ["CLI payload is not an object"];
+  }
+
+  const errors: string[] = [];
+
+  if (value.parts !== undefined) {
+    if (!Array.isArray(value.parts)) {
+      errors.push("`parts` must be an array when provided");
+    } else {
+      value.parts.forEach((part, index) => {
+        if (!isCliPartInput(part)) {
+          errors.push(`parts[${index}] is not a supported part definition`);
+        }
+      });
+    }
+  }
+
+  if (value.sheets !== undefined) {
+    if (!Array.isArray(value.sheets)) {
+      errors.push("`sheets` must be an array when provided");
+    } else {
+      value.sheets.forEach((sheet, index) => {
+        if (!isCliSheetInput(sheet)) {
+          errors.push(`sheets[${index}] is not a supported sheet definition`);
+        }
+      });
+    }
+  }
+
+  if (value.settings !== undefined && !isObject(value.settings)) {
+    errors.push("`settings` must be an object when provided");
+  }
+
+  if (value.autoStart !== undefined && typeof value.autoStart !== "boolean") {
+    errors.push("`autoStart` must be a boolean when provided");
+  }
+
+  if (value.output !== undefined) {
+    if (!isObject(value.output)) {
+      errors.push("`output` must be an object when provided");
+    } else if (
+      value.output.resultJson !== undefined &&
+      typeof value.output.resultJson !== "string"
+    ) {
+      errors.push("`output.resultJson` must be a string when provided");
+    }
+  }
+
+  return errors;
+}
+
+function getCliPointsSummary(points: CliPointInput[] | undefined): Record<string, number | null> {
+  if (!Array.isArray(points) || points.length === 0) {
+    return {
+      count: 0,
+      minX: null,
+      minY: null,
+      maxX: null,
+      maxY: null,
+    };
+  }
+
+  const xs = points.map((point) => point.x);
+  const ys = points.map((point) => point.y);
+
+  return {
+    count: points.length,
+    minX: Math.min(...xs),
+    minY: Math.min(...ys),
+    maxX: Math.max(...xs),
+    maxY: Math.max(...ys),
+  };
+}
+
+function summarizeDeepNestWorkspace(): Record<string, number> {
+  const deepNest = getDeepNest();
+  const parts = Array.isArray(deepNest?.parts) ? deepNest.parts : [];
+  const sheetParts = parts.filter((part) => part.sheet);
+  const nestingParts = parts.filter((part) => !part.sheet);
+
+  return {
+    totalEntries: parts.length,
+    sheetsCount: sheetParts.length,
+    deepNestPartsCount: nestingParts.length,
+    sheetQuantitySum: sheetParts.reduce((sum, part) => sum + (part.quantity || 1), 0),
+    partQuantitySum: nestingParts.reduce((sum, part) => sum + (part.quantity || 1), 0),
+  };
+}
+
 async function getCliInput(): Promise<CliInputEnvelope | null> {
   console.log("[cli-input][renderer] getCliInput() called");
+  debugInfo("renderer.get-cli-input.requested");
 
   if (!ipcRenderer) {
     console.warn("[cli-input][renderer] ipcRenderer is not available");
+    debugWarn("renderer.get-cli-input.unavailable");
     return null;
   }
 
   try {
     const result = (await ipcRenderer.invoke("get-cli-input")) as CliInputEnvelope | null;
     console.log("[cli-input][renderer] getCliInput() result:", result);
+    debugInfo("renderer.get-cli-input.response", {
+      path: result?.path ?? null,
+      hasData: Boolean(result?.data),
+      error: result?.error ?? null,
+    });
     return result;
   } catch (error) {
     console.error("[cli-input][renderer] Failed to fetch CLI input:", error);
+    debugError("renderer.get-cli-input.failure", error);
     return null;
   }
 }
@@ -395,9 +511,13 @@ function normalizeCliSettingsForInternalConfig(
 
 function applyCliSettings(settings: CliSettingsInput): void {
   console.log("[cli-input][renderer] applyCliSettings() start", settings);
+  debugInfo("renderer.cli.settings.apply-start", {
+    input: settings,
+  });
 
   if (!configService) {
     console.warn("[cli-input][renderer] configService is missing");
+    debugWarn("renderer.cli.settings.config-missing");
     return;
   }
 
@@ -459,6 +579,9 @@ function applyCliSettings(settings: CliSettingsInput): void {
     "[cli-input][renderer] applyCliSettings() done",
     normalizedSettings
   );
+  debugInfo("renderer.cli.settings.apply-done", {
+    normalizedSettings,
+  });
 }
 
 function getCliSheetConversionFactor(): number {
@@ -530,16 +653,28 @@ function addCliPolygonPart(points: CliPointInput[]): boolean {
 
   if (!deepNest || !Array.isArray(deepNest.parts)) {
     console.warn("[cli-input][renderer] deepNest not available for polygon part");
+    debugWarn("renderer.cli.part-points.deepnest-missing");
     return false;
   }
 
   if (!Array.isArray(points) || points.length < 3) {
     console.warn("[cli-input][renderer] Invalid polygon part points");
+    debugWarn("renderer.cli.part-points.invalid", {
+      summary: getCliPointsSummary(points),
+    });
     return false;
   }
 
+  const beforeCount = deepNest.parts.length;
   const svgString = createPolygonPartSvg(points);
   const importedParts = deepNest.importsvg(null, null, svgString);
+  debugInfo("renderer.cli.part-points.imported", {
+    inputPoints: getCliPointsSummary(points),
+    beforeCount,
+    addedCount: importedParts.length,
+    afterCount: deepNest.parts.length,
+    workspace: summarizeDeepNestWorkspace(),
+  });
 
   return importedParts.length > 0;
 }
@@ -576,36 +711,58 @@ function addCliPolygonSheet(
 
   if (!deepNest || !Array.isArray(deepNest.parts)) {
     console.warn("[cli-input][renderer] deepNest not available for polygon sheet");
+    debugWarn("renderer.cli.sheet-polygon.deepnest-missing");
     return false;
   }
 
   if (!Array.isArray(outer) || outer.length < 3) {
     console.warn("[cli-input][renderer] Invalid polygon sheet outer contour");
+    debugWarn("renderer.cli.sheet-polygon.invalid-outer", {
+      summary: getCliPointsSummary(outer),
+    });
     return false;
   }
 
   if (!Array.isArray(holes)) {
     console.warn("[cli-input][renderer] Invalid polygon sheet holes array");
+    debugWarn("renderer.cli.sheet-polygon.invalid-holes");
     return false;
   }
 
+  const beforeCount = deepNest.parts.length;
   const svgString = createPolygonSheetSvg(outer, holes);
   const parts = deepNest.importsvg(null, null, svgString);
 
   if (parts.length > 0) {
     const sheet = parts[0];
     sheet.sheet = true;
+    debugInfo("renderer.cli.sheet-polygon.added", {
+      outer: getCliPointsSummary(outer),
+      holesCount: holes.length,
+      beforeCount,
+      afterCount: deepNest.parts.length,
+      workspace: summarizeDeepNestWorkspace(),
+    });
     return true;
   }
+
+  debugWarn("renderer.cli.sheet-polygon.import-empty", {
+    outer: getCliPointsSummary(outer),
+    holesCount: holes.length,
+  });
 
   return false;
 }
 
 function loadCliSheets(sheets: CliSheetInput[]): void {
   console.log("[cli-input][renderer] loadCliSheets() start", sheets);
+  debugInfo("renderer.cli.sheets.load-start", {
+    sheetsCount: sheets.length,
+  });
 
   if (!sheetDialogService) {
     console.warn("[cli-input][renderer] sheetDialogService is missing");
+    debugWarn("renderer.cli.sheets.sheet-dialog-missing");
     return;
   }
 
@@ -620,6 +777,14 @@ function loadCliSheets(sheets: CliSheetInput[]): void {
     if (isCliPolygonSheetInput(sheet)) {
 	  for (let i = 0; i < quantity; i++) {
 		const ok = addCliPolygonSheet(sheet.outer, sheet.holes ?? []);
+        debugInfo("renderer.cli.sheet.processed", {
+          type: "polygon",
+          quantity,
+          iteration: i,
+          ok,
+          outer: getCliPointsSummary(sheet.outer),
+          holesCount: Array.isArray(sheet.holes) ? sheet.holes.length : 0,
+        });
 		if (!ok) {
 		  console.warn("[cli-input][renderer] Failed to add polygon sheet", sheet);
 		}
@@ -630,15 +795,25 @@ function loadCliSheets(sheets: CliSheetInput[]): void {
     if (isCliRectSheetInput(sheet)) {
       for (let i = 0; i < quantity; i++) {
         if (sheet.width > 0 && sheet.height > 0) {
-          sheetDialogService.addSheet(sheet.width, sheet.height);
+          const ok = sheetDialogService.addSheet(sheet.width, sheet.height);
+          debugInfo("renderer.cli.sheet.processed", {
+            type: "rect",
+            quantity,
+            iteration: i,
+            ok,
+            width: sheet.width,
+            height: sheet.height,
+          });
         } else {
           console.warn("[cli-input][renderer] Invalid rectangular sheet", sheet);
+          debugWarn("renderer.cli.sheet.invalid-rect", sheet);
         }
       }
       continue;
     }
 
     console.warn("[cli-input][renderer] Unsupported sheet definition", sheet);
+    debugWarn("renderer.cli.sheet.unsupported", sheet);
   }
 
   if (partsViewService) {
@@ -650,10 +825,16 @@ function loadCliSheets(sheets: CliSheetInput[]): void {
   resize();
 
   console.log("[cli-input][renderer] loadCliSheets() done");
+  debugInfo("renderer.cli.sheets.load-done", {
+    workspace: summarizeDeepNestWorkspace(),
+  });
 }
 
 async function loadCliParts(parts: CliPartInput[]): Promise<void> {
   console.log("[cli-input][renderer] loadCliParts() start", parts);
+  debugInfo("renderer.cli.parts.load-start", {
+    partsCount: parts.length,
+  });
 
 	for (const part of parts) {
 	  if (typeof part.path === "string" && part.path.trim().length > 0) {
@@ -664,6 +845,13 @@ async function loadCliParts(parts: CliPartInput[]): Promise<void> {
 		await importService.processFile(part.path);
 
 		const added = deepNest.parts.slice(beforeCount).filter((p) => !p.sheet);
+        debugInfo("renderer.cli.part-file.imported", {
+          path: part.path,
+          requestedQuantity: part.quantity ?? 1,
+          requestedRotations: part.rotations ?? 1,
+          addedCount: added.length,
+          workspace: summarizeDeepNestWorkspace(),
+        });
 		added.forEach((p, idx) => {
 		  cliImportedPartRefs.push({
 			deepNestPartRef: p,
@@ -682,6 +870,14 @@ async function loadCliParts(parts: CliPartInput[]): Promise<void> {
 
 		if (ok) {
 		  const added = deepNest.parts.slice(beforeCount).filter((p) => !p.sheet);
+          debugInfo("renderer.cli.part-points.processed", {
+            ok,
+            inputPoints: getCliPointsSummary(part.points),
+            requestedQuantity: part.quantity ?? 1,
+            requestedRotations: part.rotations ?? 1,
+            addedCount: added.length,
+            workspace: summarizeDeepNestWorkspace(),
+          });
 		  added.forEach((p, idx) => {
 			cliImportedPartRefs.push({
 			  deepNestPartRef: p,
@@ -692,11 +888,17 @@ async function loadCliParts(parts: CliPartInput[]): Promise<void> {
 		}
 		if (!ok) {
 		  console.warn("[cli-input][renderer] Failed to add polygon points part", part);
+          debugWarn("renderer.cli.part-points.failed", {
+            inputPoints: getCliPointsSummary(part.points),
+            requestedQuantity: part.quantity ?? 1,
+            requestedRotations: part.rotations ?? 1,
+          });
 		}
 		continue;
 	  }
 
 	  console.warn("[cli-input][renderer] Unsupported part definition", part);
+      debugWarn("renderer.cli.part.unsupported", part);
 	}
 
   if (partsViewService) {
@@ -708,14 +910,23 @@ async function loadCliParts(parts: CliPartInput[]): Promise<void> {
   resize();
 
   console.log("[cli-input][renderer] loadCliParts() done");
+  debugInfo("renderer.cli.parts.load-done", {
+    importedRefs: cliImportedPartRefs.length,
+    workspace: summarizeDeepNestWorkspace(),
+  });
 }
 
 function applyCliQuantities(parts: CliPartInput[]): void {
   console.log("[cli-input][renderer] applyCliQuantities() start", parts);
+  debugInfo("renderer.cli.parts.apply-quantities-start", {
+    inputPartsCount: parts.length,
+    importedRefs: cliImportedPartRefs.length,
+  });
 
   const deepNest = getDeepNest();
   if (!deepNest || !Array.isArray(deepNest.parts)) {
     console.warn("[cli-input][renderer] deepNest.parts not available");
+    debugWarn("renderer.cli.parts.apply-quantities.deepnest-missing");
     return;
   }
 
@@ -737,6 +948,21 @@ function applyCliQuantities(parts: CliPartInput[]): void {
     if (typeof ref.inputPart.rotations === "number") {
       deepNestPart.rotations = ref.inputPart.rotations;
     }
+
+    debugInfo("renderer.cli.part.quantity-applied", {
+      instanceIndex: ref.instanceIndex,
+      quantity: deepNestPart.quantity ?? null,
+      rotations: deepNestPart.rotations ?? null,
+      sourceType:
+        typeof ref.inputPart.path === "string"
+          ? "file"
+          : Array.isArray(ref.inputPart.points)
+            ? "points"
+            : "unknown",
+      pointsSummary: Array.isArray(ref.inputPart.points)
+        ? getCliPointsSummary(ref.inputPart.points)
+        : null,
+    });
   }
 
   if (partsViewService) {
@@ -744,6 +970,9 @@ function applyCliQuantities(parts: CliPartInput[]): void {
   }
 
   console.log("[cli-input][renderer] applyCliQuantities() done");
+  debugInfo("renderer.cli.parts.apply-quantities-done", {
+    workspace: summarizeDeepNestWorkspace(),
+  });
 }
 
 interface CliNestPlacement {
@@ -953,6 +1182,10 @@ async function syncSelectedNestToResultJson(
 ): Promise<void> {
   const result = getSelectedOrBestNestResult();
   if (!result) {
+    debugWarn("renderer.cli.result-sync.skipped-no-result", {
+      cliInputPath,
+      requestedOutputPath: requestedOutputPath ?? null,
+    });
     return;
   }
 
@@ -960,10 +1193,18 @@ async function syncSelectedNestToResultJson(
   const signature = JSON.stringify(payload);
 
   if (signature === lastResultSignature) {
+    debugInfo("renderer.cli.result-sync.skipped-unchanged", {
+      requestedOutputPath: requestedOutputPath ?? null,
+    });
     return;
   }
 
   lastResultSignature = signature;
+  debugInfo("renderer.cli.result-sync.write", {
+    cliInputPath,
+    requestedOutputPath: requestedOutputPath ?? null,
+    status: payload["status"] ?? null,
+  });
   await writeCliResultJson(requestedOutputPath, payload);
 }
 
@@ -1232,6 +1473,7 @@ async function writeCliResultJson(
   payload: Record<string, unknown>
 ): Promise<void> {
   if (!ipcRenderer) {
+    debugError("renderer.cli.write-result.ipc-missing");
     throw new Error("ipcRenderer is not available");
   }
 
@@ -1242,50 +1484,85 @@ async function writeCliResultJson(
   )) as { success: boolean; error?: string; outputPath?: string };
 
   if (!result?.success) {
+    debugError("renderer.cli.write-result.failure", {
+      requestedOutputPath: outputPath ?? null,
+      error: result?.error ?? "Unknown error while writing result JSON",
+    });
     throw new Error(result?.error || "Unknown error while writing result JSON");
   }
 
   console.log("[cli-output][renderer] Result JSON synced:", result.outputPath);
+  debugInfo("renderer.cli.write-result.success", {
+    requestedOutputPath: outputPath ?? null,
+    actualOutputPath: result.outputPath ?? null,
+  });
 }
 
 
 
 async function bootstrapCliJob(): Promise<void> {
   console.log("[cli-input][renderer] bootstrapCliJob() entered");
+  debugInfo("renderer.cli.bootstrap.entered");
 
   const cliInput = await getCliInput();
   console.log("[cli-input][renderer] bootstrapCliJob() envelope:", cliInput);
+  debugInfo("renderer.cli.bootstrap.envelope", {
+    path: cliInput?.path ?? null,
+    hasData: Boolean(cliInput?.data),
+    error: cliInput?.error ?? null,
+  });
 
   if (!cliInput) {
     console.log("[cli-input][renderer] No CLI envelope returned");
+    debugWarn("renderer.cli.bootstrap.no-envelope");
     return;
   }
 
   if (cliInput.error) {
     console.error("[cli-input][renderer] CLI input error:", cliInput.error);
+    debugError("renderer.cli.bootstrap.input-error", {
+      path: cliInput.path,
+      error: cliInput.error,
+    });
     return;
   }
 
   if (!cliInput.data) {
     console.log("[cli-input][renderer] CLI envelope has no data");
+    debugInfo("renderer.cli.bootstrap.no-data", {
+      path: cliInput.path,
+    });
     return;
   }
 
   console.log("[cli-input][renderer] Raw CLI payload:", cliInput.data);
 
-  if (!isCliJobInput(cliInput.data)) {
+  const validationErrors = getCliJobValidationErrors(cliInput.data);
+  if (validationErrors.length > 0 || !isCliJobInput(cliInput.data)) {
     console.warn(
       "[cli-input][renderer] CLI JSON is present but not a supported job format:",
       cliInput.data
     );
+    debugWarn("renderer.cli.bootstrap.validation-rejected", {
+      reasons: validationErrors,
+      path: cliInput.path,
+    });
     return;
   }
 
   const job = cliInput.data;
   console.log("[cli-input][renderer] Parsed CLI job:", job);
+  debugInfo("renderer.cli.bootstrap.valid-job", {
+    path: cliInput.path,
+    sheetsCount: Array.isArray(job.sheets) ? job.sheets.length : 0,
+    partsCount: Array.isArray(job.parts) ? job.parts.length : 0,
+    autoStart: job.autoStart !== false,
+    requestedOutputPath: job.output?.resultJson ?? null,
+  });
   
   cliJobContext = job;
   cliImportedPartRefs = [];
+  lastResultSignature = "";
 
   if (job.settings) {
     console.log("[cli-input][renderer] Applying settings");
@@ -1305,10 +1582,18 @@ async function bootstrapCliJob(): Promise<void> {
   }
 
   console.log("[cli-input][renderer] autoStart:", job.autoStart);
+  debugInfo("renderer.cli.bootstrap.workspace-ready", {
+    workspace: summarizeDeepNestWorkspace(),
+    importedRefs: cliImportedPartRefs.length,
+  });
 
   if (job.autoStart !== false) {
     console.log("[cli-input][renderer] Starting nesting automatically");
-    nestingService.startNesting();
+    const started = nestingService.startNesting();
+    debugInfo("renderer.cli.bootstrap.autostart", {
+      started,
+      workspace: summarizeDeepNestWorkspace(),
+    });
 
     const outputPath = job.output?.resultJson;
 	if (outputPath) {
@@ -1321,13 +1606,17 @@ async function bootstrapCliJob(): Promise<void> {
 
 	  void syncSelectedNestToResultJson(cliInput.path, outputPath).catch((error) => {
 		console.error("[cli-output][renderer] Initial result sync failed:", error);
+        debugError("renderer.cli.bootstrap.initial-result-sync-failed", error);
 	  });
 	}
+  } else {
+    debugInfo("renderer.cli.bootstrap.autostart-disabled");
   }
 }
 
 function triggerCliResultSync(): void {
   console.log("[cli-output][renderer] triggerCliResultSync() called");
+  debugInfo("renderer.cli.result-sync.triggered");
 
   const syncState = (window as unknown as {
     __cliResultSync?: { inputPath: string | null; outputPath?: string };
@@ -1336,6 +1625,7 @@ function triggerCliResultSync(): void {
   console.log("[cli-output][renderer] syncState:", syncState);
 
   if (!syncState) {
+    debugWarn("renderer.cli.result-sync.no-state");
     return;
   }
 
@@ -1344,6 +1634,7 @@ function triggerCliResultSync(): void {
     syncState.outputPath
   ).catch((error) => {
     console.error("[cli-output][renderer] Result sync failed:", error);
+    debugError("renderer.cli.result-sync.failure", error);
   });
 }
 
@@ -1767,6 +2058,7 @@ function initializeConfigForm(): void {
 function initializeBackgroundProgress(): void {
   ipcRenderer.on(IPC_CHANNELS.BACKGROUND_PROGRESS, (_event: unknown, ...args: unknown[]) => {
     const p = args[0] as NestingProgress;
+    debugInfo("renderer.background-progress.received", p);
     const bar = getElement<HTMLElement>("#progressbar");
     if (bar) {
       const progress = p.progress;
@@ -2092,6 +2384,7 @@ async function initialize(): Promise<void> {
   try {
     // Load required Electron and Node.js modules
     const electron = require("electron") as { ipcRenderer: IpcRenderer };
+    const { createDebugLogger } = require("../build/debug.js") as CreateDebugLoggerModule;
     ipcRenderer = electron.ipcRenderer;
     electronRemote = require("@electron/remote") as typeof electronRemote;
     fs = require("graceful-fs");
@@ -2099,6 +2392,17 @@ async function initialize(): Promise<void> {
     axios = require("axios") as typeof axios;
     path = require("path") as typeof path;
     svgPreProcessor = require("@deepnest/svg-preprocessor") as typeof svgPreProcessor;
+
+    const debugLogger = createDebugLogger({
+      argv: process.argv,
+      scope: "renderer",
+    });
+    setUiDebugLogger(debugLogger);
+    debugLogger.startSession({ processType: "renderer" });
+    debugInfo("renderer.initialize.start", {
+      argv: process.argv,
+      cwd: process.cwd(),
+    });
 
     // Disable Ractive debug mode
     Ractive.DEBUG = false;
@@ -2125,17 +2429,25 @@ async function initialize(): Promise<void> {
     initializeVersionInfo();
     initializeImportButton();
     initializeExportButtons();
+    debugInfo("renderer.initialize.ui-ready");
 
     // Load initial files from nest directory
     await loadInitialFiles();
+    debugInfo("renderer.initialize.initial-files-loaded", {
+      workspace: summarizeDeepNestWorkspace(),
+    });
 
     // Bootstrap CLI-driven job if provided
     console.log("[cli-input][renderer] About to bootstrap CLI job");
     try {
       await bootstrapCliJob();
       console.log("[cli-input][renderer] CLI bootstrap finished");
+      debugInfo("renderer.initialize.cli-bootstrap-finished", {
+        workspace: summarizeDeepNestWorkspace(),
+      });
     } catch (error) {
       console.error("[cli-input][renderer] CLI bootstrap failed:", error);
+      debugError("renderer.initialize.cli-bootstrap-failed", error);
     }
 
     // Set up loginWindow reference
@@ -2143,8 +2455,10 @@ async function initialize(): Promise<void> {
       null;
 
     console.log("[init] initialize() done");
+    debugInfo("renderer.initialize.done");
   } catch (error) {
     console.error("[init] initialize() failed:", error);
+    debugError("renderer.initialize.failed", error);
   }
 }
 

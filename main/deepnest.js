@@ -7,6 +7,14 @@ import { Point } from '../build/util/point.js';
 import { HullPolygon } from '../build/util/HullPolygon.js';
 
 const { simplifyPolygon: simplifyPoly } = require("@deepnest/svg-preprocessor");
+const { createDebugLogger } = require("./debug");
+
+const deepnestDebugLogger = createDebugLogger({
+  argv: process.argv,
+  scope: "renderer:deepnest",
+});
+
+deepnestDebugLogger.startSession({ processType: "renderer-deepnest" });
 
 var config = {
   clipperScale: 10000000,
@@ -24,6 +32,37 @@ var config = {
   simplify: false,
   overlapTolerance: 0.0001,
 };
+
+function countTreePoints(tree) {
+  if (!Array.isArray(tree)) {
+    return 0;
+  }
+
+  let count = tree.length;
+  if (Array.isArray(tree.children)) {
+    for (let i = 0; i < tree.children.length; i++) {
+      count += countTreePoints(tree.children[i]);
+    }
+  }
+
+  return count;
+}
+
+function summarizePartEntries(parts) {
+  return {
+    totalEntries: parts.length,
+    sheetCount: parts.filter((part) => part.sheet).length,
+    nestingPartsCount: parts.filter((part) => !part.sheet).length,
+    quantitySum: parts
+      .filter((part) => !part.sheet)
+      .reduce((sum, part) => sum + (part.quantity || 1), 0),
+    sheetQuantitySum: parts
+      .filter((part) => part.sheet)
+      .reduce((sum, part) => sum + (part.quantity || 1), 0),
+    rotations: parts.filter((part) => !part.sheet).map((part) => part.rotations || 1),
+    pointCount: parts.reduce((sum, part) => sum + countTreePoints(part.polygontree), 0),
+  };
+}
 
 export class DeepNest {
   constructor(eventEmitter) {
@@ -60,6 +99,14 @@ export class DeepNest {
     scalingFactor,
     dxfFlag
   ) {
+    deepnestDebugLogger.info("deepnest.importsvg.start", {
+      filename,
+      dirpath,
+      hasSvgString: typeof svgstring === "string",
+      svgLength: typeof svgstring === "string" ? svgstring.length : 0,
+      scalingFactor: scalingFactor ?? null,
+      dxfFlag: Boolean(dxfFlag),
+    });
     // parse svg
     // config.scale is the default scale, and may not be applied
     // scalingFactor is an absolute scaling that must be applied regardless of input svg contents
@@ -77,6 +124,12 @@ export class DeepNest {
     for (var i = 0; i < parts.length; i++) {
       this.parts.push(parts[i]);
     }
+
+    deepnestDebugLogger.info("deepnest.importsvg.done", {
+      filename,
+      importedPartsCount: parts.length,
+      workspace: summarizePartEntries(this.parts),
+    });
 
     return parts;
   };
@@ -508,6 +561,8 @@ export class DeepNest {
       return config;
     }
 
+    deepnestDebugLogger.info("deepnest.config.update-requested", c);
+
     if (
       c.curveTolerance &&
       !GeometryUtil.almostEqual(parseFloat(c.curveTolerance), 0)
@@ -581,6 +636,7 @@ export class DeepNest {
     //nfpCache = {};
     //binPolygon = null;
     this.GA = null;
+    deepnestDebugLogger.info("deepnest.config.updated", config);
 
     return config;
   };
@@ -720,6 +776,11 @@ export class DeepNest {
     // turn the list into a tree
     // root level nodes of the tree are parts
     toTree(polygons);
+    deepnestDebugLogger.info("deepnest.get-parts.tree-built", {
+      filename,
+      inputElementsCount: numChildren,
+      polygonsCount: polygons.length,
+    });
 
     function toTree(list, idstart) {
       function svgToClipper(polygon) {
@@ -1030,6 +1091,19 @@ export class DeepNest {
   start(p, d) {
     this.progressCallback = p;
     this.displayCallback = d;
+    deepnestDebugLogger.info("deepnest.start.requested", {
+      config: {
+        spacing: config.spacing,
+        partToSheet: config.partToSheet,
+        partToHole: config.partToHole,
+        populationSize: config.populationSize,
+        mutationRate: config.mutationRate,
+        threads: config.threads,
+        placementType: config.placementType,
+        simplify: config.simplify,
+      },
+      workspace: summarizePartEntries(this.parts),
+    });
 
     var parts = [];
 
@@ -1047,6 +1121,10 @@ export class DeepNest {
 		  filename: this.parts[i].filename,
 	  });
     }
+
+    deepnestDebugLogger.info("deepnest.start.payload-built", {
+      workspace: summarizePartEntries(parts),
+    });
 
         for (var i = 0; i < parts.length; i++) {
       if (parts[i].sheet) {
@@ -1220,6 +1298,12 @@ export class DeepNest {
     this.eventEmitter.on("background-response", (event, payload) => {
       this.eventEmitter.send("setPlacements", payload);
       console.log("ipc response", payload);
+      deepnestDebugLogger.info("deepnest.background-response", {
+        index: payload?.index,
+        fitness: payload?.fitness,
+        area: payload?.area,
+        placementsCount: Array.isArray(payload?.placements) ? payload.placements.length : 0,
+      });
       if (!this.GA) {
         // user might have quit while we're away
         return;
@@ -1346,6 +1430,11 @@ export class DeepNest {
 
       this.GA = new GeneticAlgorithm(adam, config);
       //console.log(GA.population[1].placement);
+      deepnestDebugLogger.info("deepnest.launch-workers.ga-created", {
+        adamCount: adam.length,
+        populationSize: this.GA.population.length,
+        rotations: adam.map((part) => part.rotations || 1),
+      });
     }
 
     // check if current generation is finished
@@ -1366,6 +1455,11 @@ export class DeepNest {
     var running = this.GA.population.filter(function (p) {
       return !!p.processing;
     }).length;
+    deepnestDebugLogger.info("deepnest.launch-workers.tick", {
+      running,
+      populationSize: this.GA.population.length,
+      finished,
+    });
 
     var sheets = [];
     var sheetids = [];
@@ -1429,6 +1523,18 @@ export class DeepNest {
           children: children,
           filenames: filenames,
 		  rotations: rotations,
+        });
+        deepnestDebugLogger.info("deepnest.background-start.sent", {
+          index: i,
+          sheetCount: sheets.length,
+          sheetPointCount: sheets.reduce((sum, sheet) => sum + countTreePoints(sheet), 0),
+          placementCount: this.GA.population[i].placement.length,
+          placementPointCount: this.GA.population[i].placement.reduce(
+            (sum, placement) => sum + countTreePoints(placement),
+            0
+          ),
+          rotationsCount: rotations.length,
+          populationSize: this.GA.population.length,
         });
         running++;
       }
@@ -1613,6 +1719,10 @@ export class DeepNest {
   };
 
   stop() {
+    deepnestDebugLogger.info("deepnest.stop", {
+      hasGA: Boolean(this.GA),
+      nestsCount: this.nests.length,
+    });
     this.working = false;
     if (this.GA && this.GA.population && this.GA.population.length > 0) {
       this.GA.population.forEach(function (i) {
@@ -1626,6 +1736,9 @@ export class DeepNest {
   };
 
   reset() {
+    deepnestDebugLogger.info("deepnest.reset", {
+      nestsCount: this.nests.length,
+    });
     this.GA = null;
     while (this.nests.length > 0) {
       this.nests.pop();

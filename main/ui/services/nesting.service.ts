@@ -13,6 +13,7 @@ import type {
 } from "../types/index.js";
 import { IPC_CHANNELS } from "../types/index.js";
 import { message } from "../utils/ui-helpers.js";
+import { debugInfo, debugWarn } from "../utils/debug.js";
 
 /**
  * File system interface for cache operations
@@ -428,21 +429,46 @@ export class NestingService {
   startNesting(progressCallback?: ProgressCallback): boolean {
     if (!this.deepNest) {
       message("DeepNest instance not available", true);
+      debugWarn("renderer.nesting.start.deepnest-missing");
       return false;
     }
 
     if (this.isStarting) {
+      debugWarn("renderer.nesting.start.already-starting");
       return false;
     }
+
+    const totalEntries = this.deepNest.parts.length;
+    const sheetCount = this.deepNest.parts.filter((part) => part.sheet).length;
+    const partCount = this.deepNest.parts.filter((part) => !part.sheet).length;
+    const quantitySum = this.deepNest.parts
+      .filter((part) => !part.sheet)
+      .reduce((sum, part) => sum + (part.quantity || 1), 0);
+
+    debugInfo("renderer.nesting.start.requested", {
+      totalEntries,
+      sheetCount,
+      partCount,
+      quantitySum,
+      working: this.deepNest.working,
+    });
 
     // Check prerequisites
     if (!this.hasParts()) {
       message("Please import some parts first");
+      debugWarn("renderer.nesting.start.rejected-no-parts", {
+        totalEntries,
+        sheetCount,
+      });
       return false;
     }
 
     if (!this.hasSheet()) {
       message("Please mark at least one part as the sheet");
+      debugWarn("renderer.nesting.start.rejected-no-sheet", {
+        totalEntries,
+        partCount,
+      });
       return false;
     }
 
@@ -460,6 +486,12 @@ export class NestingService {
 
       // Start the nesting process
       this.deepNest.start(progressCallback || null, displayCallback);
+      debugInfo("renderer.nesting.start.started", {
+        totalEntries,
+        sheetCount,
+        partCount,
+        quantitySum,
+      });
 
       return true;
     } finally {
@@ -473,10 +505,12 @@ export class NestingService {
    */
   stopNesting(): boolean {
     if (!this.deepNest) {
+      debugWarn("renderer.nesting.stop.deepnest-missing");
       return false;
     }
 
     if (this.isStopping) {
+      debugWarn("renderer.nesting.stop.already-stopping");
       return false;
     }
 
@@ -487,6 +521,7 @@ export class NestingService {
       if (this.ipcRenderer) {
         this.ipcRenderer.send(IPC_CHANNELS.BACKGROUND_STOP);
       }
+      debugInfo("renderer.nesting.stop.requested");
 
       // Stop the DeepNest instance
       this.deepNest.stop();
@@ -501,6 +536,9 @@ export class NestingService {
       if (this.saveJsonFn) {
         this.saveJsonFn();
       }
+      debugInfo("renderer.nesting.stop.completed", {
+        nestsCount: this.deepNest.nests.length,
+      });
 
       // After a delay, switch button to start state
       setTimeout(() => {
@@ -527,10 +565,12 @@ export class NestingService {
 
     if (buttonClass === BUTTON_CLASSES.STOP) {
       // Currently showing stop button - stop nesting
+      debugInfo("renderer.nesting.toggle.stop-clicked");
       this.stopNesting();
     } else if (buttonClass === BUTTON_CLASSES.START) {
       // Currently showing start button - start nesting
       this.updateStopButton("stop-disabled");
+      debugInfo("renderer.nesting.toggle.start-clicked");
 
       // After a delay, switch to stop state and start nesting
       setTimeout(() => {
@@ -548,6 +588,7 @@ export class NestingService {
   goBack(): void {
     // Switch to main view immediately
     this.switchToMainView();
+    debugInfo("renderer.nesting.go-back");
 
     // Perform cleanup after a delay to allow for animation
     setTimeout(() => {
@@ -648,7 +689,10 @@ export class NestingService {
     // Bind start button
     const startButton = document.querySelector(SELECTORS.START_BUTTON);
     if (startButton) {
-      startButton.addEventListener("click", () => this.startNesting());
+      startButton.addEventListener("click", () => {
+        debugInfo("renderer.nesting.start-button.clicked");
+        this.startNesting();
+      });
     }
 
     // Bind stop/start toggle button
