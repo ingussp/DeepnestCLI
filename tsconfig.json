@@ -22,6 +22,6 @@
     "types": ["node"],
     "lib": ["ES2020", "ES6", "DOM"]
   },
-  "include": ["main/**/*.ts", "main/ui/**/*.ts"],
+  "include": ["main/debug.js", "main/**/*.ts", "main/ui/**/*.ts"],
   "exclude": ["node_modules", "**/*.test.ts"]
 }

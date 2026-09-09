@@ -36,6 +36,45 @@
 
 import { NfpCache } from '../build/nfpDb.js';
 import { HullPolygon } from '../build/util/HullPolygon.js';
+const { createDebugLogger } = require("./debug");
+
+const backgroundDebugLogger = createDebugLogger({
+  argv: process.argv,
+  scope: "background",
+});
+
+backgroundDebugLogger.startSession({ processType: "background-window" });
+
+function countPolygonPoints(polygon) {
+  if (!Array.isArray(polygon)) {
+    return 0;
+  }
+
+  let count = polygon.length;
+  if (Array.isArray(polygon.children)) {
+    for (let i = 0; i < polygon.children.length; i++) {
+      count += countPolygonPoints(polygon.children[i]);
+    }
+  }
+
+  return count;
+}
+
+function summarizeBackgroundJob(data, parts) {
+  const sheets = Array.isArray(data?.sheets) ? data.sheets : [];
+  const placement = Array.isArray(parts) ? parts : [];
+
+  return {
+    index: data?.index,
+    sheetCount: sheets.length,
+    sheetPointCount: sheets.reduce((sum, sheet) => sum + countPolygonPoints(sheet), 0),
+    partsCount: placement.length,
+    partPointCount: placement.reduce((sum, part) => sum + countPolygonPoints(part), 0),
+    rotationsCount: Array.isArray(data?.rotations) ? data.rotations.length : 0,
+    populationSize: data?.config?.populationSize,
+    threads: data?.config?.threads,
+  };
+}
 
 window.onload = function () {
   const { ipcRenderer } = require('electron');
@@ -51,6 +90,20 @@ window.onload = function () {
     window.fq = new FileQueue(500);
   */
   window.db = new NfpCache();
+  backgroundDebugLogger.info("background.window.onload");
+
+  window.addEventListener("error", (event) => {
+    backgroundDebugLogger.error("background.window.error", {
+      message: event.message,
+      filename: event.filename,
+      lineno: event.lineno,
+      colno: event.colno,
+    });
+  });
+
+  window.addEventListener("unhandledrejection", (event) => {
+    backgroundDebugLogger.error("background.window.unhandled-rejection", event.reason);
+  });
 
   ipcRenderer.on('background-start', (event, data) => {
     var index = data.index;
@@ -63,6 +116,7 @@ window.onload = function () {
     var children = data.children;
     var filenames = data.filenames;
 	var rotationCounts = data.rotations;
+    backgroundDebugLogger.info("background.start.received", summarizeBackgroundJob(data, individual?.placement));
 
     for (let i = 0; i < parts.length; i++) {
       parts[i].rotation = rotations[i];
@@ -118,6 +172,11 @@ window.onload = function () {
     }
 
     // console.log('pairs: ', pairs.length);
+    backgroundDebugLogger.info("background.nfp.pairs-built", {
+      index,
+      pairsCount: pairs.length,
+      summary: summarizeBackgroundJob(data, parts),
+    });
 
     // ============================================================================
     // NFP (NO-FIT POLYGON) CALCULATION
@@ -251,6 +310,12 @@ window.onload = function () {
       var placement = placeParts(data.sheets, parts, data.config, index);
 
       placement.index = data.index;
+      backgroundDebugLogger.info("background.sync.completed", {
+        index: data.index,
+        fitness: placement.fitness,
+        area: placement.area,
+        placementsCount: Array.isArray(placement.placements) ? placement.placements.length : 0,
+      });
       ipcRenderer.send('background-response', placement);
     }
 
@@ -269,6 +334,11 @@ window.onload = function () {
         // hijack the worker call to check progress
         // 0.5 weight allocates first half of progress bar to NFP calculation phase, second half to placement phase
         ipcRenderer.send('background-progress', { index: index, progress: 0.5 * (spawncount++ / pairs.length) });
+        backgroundDebugLogger.info("background.progress.nfp", {
+          index,
+          progress: 0.5 * (spawncount / pairs.length),
+          pairsCount: pairs.length,
+        });
         return Parallel.prototype._spawnMapWorker.call(p, i, cb, done, env, wrk);
       }
 
@@ -276,6 +346,10 @@ window.onload = function () {
       p.require('../../main/util/geometryutil.js');
 
       p.map(process).then(function (processed) {
+        backgroundDebugLogger.info("background.nfp.processed", {
+          index,
+          processedCount: processed.length,
+        });
         function getPart(source) {
           for (let k = 0; k < parts.length; k++) {
             if (parts[k].source == source) {
@@ -331,6 +405,11 @@ window.onload = function () {
         // console.timeEnd('Total');
         // console.log('before sync');
         sync();
+      }).catch(function (error) {
+        backgroundDebugLogger.error("background.nfp.processing-failed", {
+          index,
+          error,
+        });
       });
     }
     else {
@@ -1773,7 +1852,14 @@ function placeParts(sheets, parts, config, nestindex) {
       //console.log(placednum, totalnum);
       // Progress calculation: 0.5 base (NFP phase complete) + 0.5 scaled by placement completion
       // Ensures progress bar smoothly transitions from 50% (after NFP) to 100% (all parts placed)
-      ipcRenderer.send('background-progress', { index: nestindex, progress: 0.5 + 0.5 * (placednum / totalnum) });
+      const placementProgress = 0.5 + 0.5 * (placednum / totalnum);
+      ipcRenderer.send('background-progress', { index: nestindex, progress: placementProgress });
+      backgroundDebugLogger.info("background.progress.placement", {
+        index: nestindex,
+        progress: placementProgress,
+        placednum,
+        totalnum,
+      });
       // console.timeEnd('placement');
     }
 
@@ -1857,11 +1943,25 @@ function placeParts(sheets, parts, config, nestindex) {
 
   // send finish progress signal
   ipcRenderer.send('background-progress', { index: nestindex, progress: -1 });
+  backgroundDebugLogger.info("background.progress.finished", {
+    index: nestindex,
+    unplacedParts: parts.length,
+    placementsCount: allplacements.length,
+  });
 
   console.log('WATCH', allplacements);
 
   const utilisation = totalusablesheetarea > 0 ? (totalplacedarea / totalusablesheetarea) * 100 : 0;
   console.log(`Utilisation of the sheet(s): ${utilisation.toFixed(2)}%`);
+  backgroundDebugLogger.info("background.place-parts.result", {
+    index: nestindex,
+    placementsCount: allplacements.length,
+    unplacedParts: parts.length,
+    fitness,
+    area: totalplacedarea,
+    totalarea: totalusablesheetarea,
+    utilisation,
+  });
 
   return { placements: allplacements, fitness: fitness, area: totalplacedarea, totalarea: totalusablesheetarea, mergedLength: totalMerged, utilisation: utilisation };
 }

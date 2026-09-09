@@ -13,6 +13,7 @@ import type {
 } from "../types/index.js";
 import { DEFAULT_CONVERSION_SERVER } from "../types/index.js";
 import { message } from "../utils/ui-helpers.js";
+import { debugError, debugInfo, debugWarn } from "../utils/debug.js";
 
 /**
  * File filter options for the open dialog
@@ -368,11 +369,13 @@ export class ImportService {
    */
   async loadNestDirectoryFiles(): Promise<void> {
     if (!this.remote || !this.fs) {
+      debugWarn("renderer.import.load-nest-directory.missing-deps");
       return;
     }
 
     const nestDirectory = this.remote.getGlobal("NEST_DIRECTORY");
     if (!nestDirectory) {
+      debugInfo("renderer.import.load-nest-directory.no-directory");
       return;
     }
 
@@ -385,8 +388,15 @@ export class ImportService {
       for (const file of svgFiles) {
         await this.processFile(nestDirectory + file);
       }
+      debugInfo("renderer.import.load-nest-directory.done", {
+        nestDirectory,
+        svgFilesCount: svgFiles.length,
+      });
     } catch {
       // Directory may not exist, silently continue
+      debugWarn("renderer.import.load-nest-directory.read-failed", {
+        nestDirectory,
+      });
     }
   }
 
@@ -397,6 +407,7 @@ export class ImportService {
   async showImportDialog(): Promise<void> {
     if (!this.dialog) {
       message("Dialog module not available", true);
+      debugWarn("renderer.import.dialog.unavailable");
       return;
     }
 
@@ -410,6 +421,10 @@ export class ImportService {
       const result = await this.dialog.showOpenDialog({
         filters: FILE_FILTERS,
         properties: ["openFile", "multiSelections"],
+      });
+      debugInfo("renderer.import.dialog.result", {
+        canceled: result.canceled,
+        fileCount: result.filePaths.length,
       });
 
       if (result.canceled) {
@@ -432,16 +447,29 @@ export class ImportService {
   async processFile(filePath: string): Promise<void> {
     if (!this.path) {
       message("Path module not available", true);
+      debugWarn("renderer.import.process-file.path-missing", {
+        filePath,
+      });
       return;
     }
 
     const ext = this.path.extname(filePath);
     const filename = this.path.basename(filePath);
+    debugInfo("renderer.import.process-file.start", {
+      filePath,
+      filename,
+      ext,
+    });
 
     if (ext.toLowerCase() === ".svg") {
       await this.readSvgFile(filePath);
     } else if (this.needsConversion(ext)) {
       await this.convertAndImport(filePath, filename, ext);
+    } else {
+      debugWarn("renderer.import.process-file.unsupported", {
+        filePath,
+        ext,
+      });
     }
   }
 
@@ -452,6 +480,9 @@ export class ImportService {
   private async readSvgFile(filePath: string): Promise<void> {
     if (!this.fs || !this.path) {
       message("File system modules not available", true);
+      debugWarn("renderer.import.read-svg.missing-deps", {
+        filePath,
+      });
       return;
     }
 
@@ -459,6 +490,10 @@ export class ImportService {
       this.fs!.readFile(filePath, "utf-8", (err, data) => {
         if (err) {
           message("An error occurred reading the file: " + err.message, true);
+          debugError("renderer.import.read-svg.failure", {
+            filePath,
+            error: err.message,
+          });
           resolve();
           return;
         }
@@ -467,6 +502,10 @@ export class ImportService {
         const dirpath = this.path!.dirname(filePath);
 
         this.processSvgData(data, filename, dirpath);
+        debugInfo("renderer.import.read-svg.success", {
+          filePath,
+          dataLength: data.length,
+        });
         resolve();
       });
     });
@@ -485,10 +524,20 @@ export class ImportService {
   ): Promise<void> {
     if (!this.fs || !this.httpClient || !this.FormData) {
       message("Required modules not available for conversion", true);
+      debugWarn("renderer.import.convert.missing-deps", {
+        filePath,
+        ext,
+      });
       return;
     }
 
     const url = this.getConversionServerUrl();
+    debugInfo("renderer.import.convert.start", {
+      filePath,
+      filename,
+      ext,
+      url,
+    });
 
     try {
       const fileBuffer = this.fs.readFileSync(filePath);
@@ -534,6 +583,12 @@ export class ImportService {
       // Process the converted SVG
       // Note: dirpath is null for converted files as they won't have embedded images
       this.processSvgData(body, filename, null, scalingFactor, dxfFlag);
+      debugInfo("renderer.import.convert.success", {
+        filePath,
+        responseLength: body.length,
+        scalingFactor,
+        dxfFlag,
+      });
     } catch (err) {
       const error = err as { response?: { data: string }; message: string };
       const errorData = error.response?.data || error.message;
@@ -554,6 +609,11 @@ export class ImportService {
           true
         );
       }
+      debugError("renderer.import.convert.failure", {
+        filePath,
+        ext,
+        error: errorData,
+      });
     }
   }
 
@@ -574,6 +634,13 @@ export class ImportService {
     dxfFlag = false
   ): void {
     const useSvgPreProcessor = this.config?.getSync("useSvgPreProcessor");
+    debugInfo("renderer.import.process-svg-data.start", {
+      filename,
+      dirpath,
+      scalingFactor,
+      dxfFlag,
+      useSvgPreProcessor,
+    });
 
     if (useSvgPreProcessor && this.svgPreProcessor) {
       try {
@@ -589,6 +656,10 @@ export class ImportService {
       } catch (e) {
         const error = e as Error;
         message("Error processing SVG: " + error.message, true);
+        debugError("renderer.import.process-svg-data.failure", {
+          filename,
+          error: error.message,
+        });
       }
     } else {
       this.importData(data, filename, dirpath, scalingFactor, dxfFlag);
@@ -612,9 +683,13 @@ export class ImportService {
   ): void {
     if (!this.deepNest) {
       message("DeepNest instance not available", true);
+      debugWarn("renderer.import.import-data.deepnest-missing", {
+        filename,
+      });
       return;
     }
 
+    const beforePartsCount = this.deepNest.parts.length;
     // Import the SVG into DeepNest
     this.deepNest.importsvg(filename, dirpath, data, scalingFactor, dxfFlag);
 
@@ -630,6 +705,14 @@ export class ImportService {
 
     // Update Ractive views
     this.updateViews();
+    debugInfo("renderer.import.import-data.done", {
+      filename,
+      dirpath,
+      scalingFactor,
+      dxfFlag,
+      addedPartsCount: this.deepNest.parts.length - beforePartsCount,
+      totalPartsCount: this.deepNest.parts.length,
+    });
   }
 
   /**
@@ -652,6 +735,7 @@ export class ImportService {
     if (this.resizeCallback) {
       this.resizeCallback();
     }
+    debugInfo("renderer.import.update-views");
   }
 
   /**
